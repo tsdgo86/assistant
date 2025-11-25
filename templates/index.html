@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Trantourist Assistant (ElevenLabs WebRTC)</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/assistant.css') }}">
+  <script  type="module" src="{{ url_for('static', filename='js/assistant.js') }}"></script>
+</head>
+
+<body>
+<header>
+  <div class="header-wrap">
+    <div class="logo">
+      <div class="logo-mark">TT</div>
+      <div>
+        <div style="font-size:18px; font-weight:900; line-height:1;">TRANTOURIST</div>
+        <div style="font-size:12px; opacity:.9;">Travel like a local • Trần Gia Phú Thái</div>
+      </div>
+    </div>
+
+    <nav>
+      <a href="https://trantourist.com/" target="_blank" rel="noreferrer" data-i18n="menuHome">Trang chủ</a>
+      <a href="https://trantourist.com/tour/" target="_blank" rel="noreferrer" data-i18n="menuTours">Tours</a>
+      <a href="https://trantourist.com/ve-chung-toi/" target="_blank" rel="noreferrer" data-i18n="menuAbout">Về chúng tôi</a>
+      <a href="https://trantourist.com/" target="_blank" rel="noreferrer" data-i18n="menuContact">Liên hệ</a>
+    </nav>
+
+    <!-- UI language selector with flags -->
+    <div class="ui-lang">
+      <button id="uiLangBtn" class="ui-lang-btn" aria-haspopup="listbox" aria-expanded="false">
+        <span class="flag" id="uiLangFlag">🇻🇳</span>
+        <span id="uiLangText">VI</span>
+        <span class="chev">▾</span>
+      </button>
+
+      <div id="uiLangMenu" class="ui-lang-menu" role="listbox">
+        <div class="ui-lang-item" data-lang="vi" role="option">🇻🇳 VI</div>
+        <div class="ui-lang-item" data-lang="en" role="option">🇬🇧 EN</div>
+        <div class="ui-lang-item" data-lang="zh" role="option">🇨🇳 ZH</div>
+        <div class="ui-lang-item" data-lang="ja" role="option">🇯🇵 JA</div>
+        <div class="ui-lang-item" data-lang="ko" role="option">🇰🇷 KO</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section class="layout">
+   <main>
+    <div class="card">
+      <div class="toolbar">
+        <div class="group">
+          <label data-i18n="voiceLabel">Voice:</label>
+          <select id="voiceSel"></select>
+        </div>        
+
+        <div class="group">
+          <label data-i18n="statusLabel">Trạng thái:</label>
+          <span id="status" data-i18n="statusLoading">Đang tải SDK...</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="padding:10px;">
+      <div id="chat"></div>
+
+      <div id="row">
+        <input id="text" data-i18n-placeholder="chatInputPh" placeholder="Nhập tin nhắn..." />
+        <button id="send" disabled data-i18n="sendBtn">Gửi</button>
+        <button id="call" class="primary" data-i18n="callBtn" >📞 Tạo cuộc gọi mới</button>       
+       <button id="endBtn" class="btn-end" data-i18n="endBtn" disabled>kết thúc cuộc gọi</button>
+      </div>
+
+      <div id="debug" hidden></div>
+    </div>
+  </main>
+</section>
+
+<footer>
+  <div class="footer-wrap">
+    <div class="footer-col">
+      <b>Công ty TNHH Trần Gia Phú Thái</b><br/>
+      Trantourist • onBooking
+    </div>
+    <div class="footer-col">
+      Hà Nội: Tầng 7 – 302 Nguyễn Trãi, P. Đại Mỗ<br/>
+      TP.HCM: 43 Đường 5A, P. An Lạc
+    </div>
+    <div class="footer-col">
+      Tel: (024) 3552 7406 – (028) 6282 3228<br/>
+      Email: sales1@trantourist.com
+    </div>
+    <div class="social">
+      <a href="https://www.facebook.com/TranTouristVN/" target="_blank" rel="noreferrer">Facebook</a>
+      <a href="https://trantourist.com/" target="_blank" rel="noreferrer">YouTube</a>
+      <a href="https://trantourist.com/" target="_blank" rel="noreferrer">TikTok</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

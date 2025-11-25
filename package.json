@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "voice-stream": "^1.0.1"
+  }
+}
