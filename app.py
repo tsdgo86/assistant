@@ -257,7 +257,7 @@ def extract_signed_url(r: requests.Response):
 # =========================================================
 # N8N SIGNED URL ROUTE (BỔ SUNG)
 # =========================================================
-@app.route("/signed-url")
+@app.route("/api/signed-url")
 def signed_url():
     """
     Browser -> localhost -> POST n8n -> signed_url

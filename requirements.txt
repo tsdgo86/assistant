@@ -1,0 +1,5 @@
+fastapi
+gtts
+whisper
+torch
+flask_cors

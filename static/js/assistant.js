@@ -1,66 +1,35 @@
-// static/js/assistant.js
-// Trantourist Assistant — ElevenLabs ConvAI
-// Single voice source-of-truth. Language selector removed.
-// Text uses Conversation SDK, Call uses raw ConvAI WS + PCM worklet.
-// Voice change applies to BOTH text + call in one flow.
-//
-// NOTE: Load with:
-// <script type="module" src="/static/js/assistant.js"></script>
+// assistant.js — Trantourist Assistant (fixed, 2025-11)
+// ====================== CONFIG ENDPOINTS ======================
+const SIGNED_URL_ENDPOINT   = "/api/signed-url";
+const CALL_WS_URL_ENDPOINT  = "/api/get-ws-url";
+const VOICES_ENDPOINT       = "/api/voices";
+const TTS_PREVIEW_ENDPOINT  = "/api/tts-stream";
 
-import { I18N, tUI, applyUILang, FLAG, SHORT } from "./i18n.js";
-
-const SIGNED_URL_ENDPOINT   = "/signed-url";        // text session signed url (Conversation SDK)
-const CALL_WS_URL_ENDPOINT  = "/api/get-ws-url";    // call ws signed url (Flask proxy)
-const VOICES_ENDPOINT       = "/api/voices";        // list voices: voice_id, name, label
-
-// ===== DOM =====
+/////////////////////// DOM ///////////////////////
 const chatEl   = document.getElementById("chat");
 const textEl   = document.getElementById("text");
 const sendBtn  = document.getElementById("send");
 const statusEl = document.getElementById("status");
 const debugEl  = document.getElementById("debug");
 const voiceSel = document.getElementById("voiceSel");
-
 const tourCodeEl     = document.getElementById("tourCode");
 const customerCodeEl = document.getElementById("customerCode");
 const orderCodeEl    = document.getElementById("orderCode");
-
+const endBtn  = document.getElementById("endBtn");
+const callBtn = document.getElementById("call");
 const uiLangBtn  = document.getElementById("uiLangBtn");
 const uiLangMenu = document.getElementById("uiLangMenu");
 const uiLangFlag = document.getElementById("uiLangFlag");
 const uiLangText = document.getElementById("uiLangText");
 
-const endBtn  = document.getElementById("endBtn");
-const callBtn = document.getElementById("call");
-
-// ===== STATE (TEXT SESSION via Conversation SDK) =====
-let Conversation;
-let conversation = null;
-let connected = false;
-let connecting = false;
-let heartbeat = null;
-
-// ===== STATE (VOICE CALL via raw WS + worklet) =====
-let callWs = null;
-let callMicCtx = null;
-let callMicStream = null;
-let callAudioQueue = [];
-let callPlaying = false;
-
-// ===== VOICE state =====
-let CURRENT_VOICE_ID = null;
-let CURRENT_VOICE_LABEL = null;   // multi-voice label
-let VOICE_LABEL_MAP = {};
-let VOICE_LANG_MAP = {};     // voice_id -> label
-let voiceLocked = false;
-
-// ===== last agent text (for preview / resay) =====
-let lastAgentText = "";
-
-// ===== UTIL =====
-function logDebug(msg){
-  console.log(msg);
-  if (debugEl) debugEl.textContent += msg + "\n";
+/////////////////////// Small utils ///////////////////////
+function logDebug(...args){
+  console.log(...args);
+  if (debugEl) {
+    debugEl.textContent +=
+      args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ") +
+      "\n";
+  }
 }
 function addMsg(role, text){
   const div = document.createElement("div");
@@ -69,61 +38,74 @@ function addMsg(role, text){
   chatEl.appendChild(div);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
-function updateSendState(){
-  sendBtn.disabled = textEl.value.trim().length === 0;
-}
-function wrapWithVoiceTag(text){
-  if (!CURRENT_VOICE_LABEL) return text;
-  return `<${CURRENT_VOICE_LABEL}>${text}</${CURRENT_VOICE_LABEL}>`;
-}
-function saveVoice(voiceId) {
-  localStorage.setItem("selected_voice", voiceId);
-}
-function getVoiceTagLabel(){
-  return CURRENT_VOICE_LABEL || null;
+function safeJSON(text){ try { return JSON.parse(text); } catch { return null; } }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+/////////////////////// STATE ///////////////////////
+// Conversation SDK (text)
+let Conversation, conversation = null;
+let textConnected = false;
+let textConnecting = false;
+let textHeartbeat = null;
+
+// Call WS (raw)
+let callWs = null;
+let callMicStream = null;
+let callMicCtx = null;
+let callAudioQueue = [];
+let callPlaying = false;
+let manualEnd = false;
+
+// Voice metadata
+let VOICE_LABEL_MAP = {}; // voice_id -> label
+let VOICE_LANG_MAP  = {}; // voice_id -> trained language
+let CURRENT_VOICE_ID = null;
+let CURRENT_VOICE_LABEL = null;
+let CURRENT_VOICE_LANG = "auto"; 
+
+// 🔥 cờ báo cần restart session theo voice mới
+let pendingVoiceChange = false;
+// Last agent text (for preview/resay)
+let lastAgentText = "";
+
+// UI state
+let uiLang = localStorage.getItem("ui_lang") || "vi";
+
+// ======================
+// ANTI-DUPLICATE MESSAGE
+// ======================
+let lastDisplayedAgentMsg = "";
+
+function addAgentMsgOnce(text) {
+  if (!text) return;
+  if (text.trim() === lastDisplayedAgentMsg.trim()) return; // block duplicate
+  lastDisplayedAgentMsg = text.trim();
+  addMsg("agent", text);
 }
 
-// ===== Apply voice rules to running sessions =====
-function applyVoiceRuleToTextSession(){
-  if (!conversation || !connected || !getVoiceTagLabel()) return;
-  const label = getVoiceTagLabel();
-  try{
-    conversation.sendUserMessage(
-      `SYSTEM: From now on, always reply using voice label <${label}>...</${label}> only.`
-    );
-  }catch(e){ console.warn(e); }
-}
-
-function applyVoiceRuleToCallWs(){
-  if (!callWs || callWs.readyState !== 1 || !getVoiceTagLabel()) return;
-  const label = getVoiceTagLabel();
-  try{
-    callWsSend({
-      type: "user_message",
-      text: `SYSTEM: Always speak using voice label <${label}>...</${label}> only.`
-    });
-  }catch(e){ console.warn(e); }
-}
-
-// ===== UI language header (only UI, not bot language) =====
+/////////////////////// UI language helper (minimal) ///////////////////////
 function setUILangHeader(lang){
-  if (uiLangFlag) uiLangFlag.textContent = FLAG[lang] || "🌐";
-  if (uiLangText) uiLangText.textContent = SHORT[lang] || lang.toUpperCase();
+  try {
+    if (uiLangFlag)
+      uiLangFlag.textContent = ({ vi: "🇻🇳", en: "🇬🇧" }[lang] || "🌐");
+  } catch {}
+  if (uiLangText) uiLangText.textContent = (lang || "??").toUpperCase();
   localStorage.setItem("ui_lang", lang);
-  applyUILang(lang);
+  uiLang = lang;
 }
-if (uiLangBtn && uiLangMenu){
-  uiLangBtn.addEventListener("click", ()=>{
+
+if (uiLangBtn && uiLangMenu) {
+  uiLangBtn.addEventListener("click", ()=> {
     const open = uiLangMenu.classList.toggle("open");
     uiLangBtn.setAttribute("aria-expanded", open ? "true":"false");
   });
-  document.addEventListener("click",(e)=>{
+  document.addEventListener("click", (e)=> {
     if (!uiLangMenu.contains(e.target) && !uiLangBtn.contains(e.target)){
       uiLangMenu.classList.remove("open");
       uiLangBtn.setAttribute("aria-expanded","false");
     }
   });
-  uiLangMenu.querySelectorAll(".ui-lang-item").forEach(item=>{
+  uiLangMenu.querySelectorAll?.(".ui-lang-item")?.forEach(item=>{
     item.addEventListener("click", ()=>{
       const lang = item.getAttribute("data-lang");
       setUILangHeader(lang);
@@ -132,416 +114,388 @@ if (uiLangBtn && uiLangMenu){
     });
   });
 }
-setUILangHeader(localStorage.getItem("ui_lang") || "vi");
+setUILangHeader(uiLang);
 
 
-// ===== Load voices =====
-async function loadVoices() {
+async function ensureTextSessionFresh() {
+  // Nếu chưa có session hoặc đang có cờ đổi voice, thì restart
+  if (pendingVoiceChange || !conversation || !textConnected) {
+    try {
+      await restartTextSession();
+    } catch (e) {
+      logDebug("ensureTextSessionFresh restartTextSession error:", e.message || e);
+    }
+    pendingVoiceChange = false;
+  }
+}
+
+
+/////////////////////// Voice loading & management ///////////////////////
+async function loadVoices(){
   try {
-    const res = await fetch("/api/voices", { cache: "no-store" });
+    const res = await fetch(VOICES_ENDPOINT, { cache: "no-store" });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "voices error");
-
     const voices = data.voices || [];
     voiceSel.innerHTML = "";
-    VOICE_LABEL_MAP = {};   // voice_id → label
-    VOICE_LANG_MAP  = {};   // voice_id → language_trained
+    VOICE_LABEL_MAP = {};
+    VOICE_LANG_MAP = {};
 
-    voices.forEach(v => {
-      if (!v.voice_id) return;
+   voices.forEach(v => {
+      const id = v.voice_id;
+      if (!id) return;
 
-      const voiceId = v.voice_id;
-      const name    = v.name || voiceId;
-      const trained = v.language_trained || null;
+      const name = v.name || id;
 
-      // Lưu vào state
-      // labels trong API của bạn là object, ví dụ: { "assistant_voice": "Piper" }
-      // Bạn sẽ chọn key nào là voice-label để multi-voice (tôi dùng assistant_voice)
+      // 🔥 cố gắng bắt language từ nhiều field khác nhau
+      const trained =
+        v.language_trained ||
+        v.language ||
+        v.default_language ||
+        (v.labels && (v.labels.language || v.labels.lang || v.labels.voice_lang)) ||
+        null;
+
       const label =
-        (v.labels && v.labels.assistant_voice) ||
-        (v.labels && v.labels.voice_label) ||
+        (v.labels && (v.labels.assistant_voice || v.labels.voice_label)) ||
         name;
 
-      VOICE_LABEL_MAP[voiceId] = label;
-      VOICE_LANG_MAP[voiceId]  = trained;
+      VOICE_LABEL_MAP[id] = label;
+      VOICE_LANG_MAP[id]  = trained || "auto";
 
-      // UI 
       const opt = document.createElement("option");
-      opt.value = voiceId;
+      opt.value = id;
+      opt.textContent = trained
+        ? `${name} • ${trained.toUpperCase()}`
+        : name;
 
-      // Hiển thị luôn language_trained như API trả về
-      const langTag = trained ? ` • ${trained.toUpperCase()}` : "";
-      opt.textContent = `${name}${langTag}`;
+      // 🔥 lưu language vào data attribute
+      opt.dataset.lang = trained || "auto";
 
       voiceSel.appendChild(opt);
     });
 
-    // Restore voice đã chọn trước đó
     const saved = localStorage.getItem("selected_voice");
     if (saved && VOICE_LABEL_MAP[saved]) {
       voiceSel.value = saved;
-      CURRENT_VOICE_ID = saved;
+      CURRENT_VOICE_ID    = saved;
       CURRENT_VOICE_LABEL = VOICE_LABEL_MAP[saved];
-    } else {
+      CURRENT_VOICE_LANG  = VOICE_LANG_MAP[saved] || "auto";
+    } else if (voiceSel.options.length > 0) {
       const first = voiceSel.options[0];
-      if (first) {
-        CURRENT_VOICE_ID = first.value;
-        CURRENT_VOICE_LABEL = VOICE_LABEL_MAP[first.value] || null;
-      }
+      CURRENT_VOICE_ID    = first.value;
+      CURRENT_VOICE_LABEL = VOICE_LABEL_MAP[first.value] || null;
+      CURRENT_VOICE_LANG  = first.dataset.lang || VOICE_LANG_MAP[first.value] || "auto";
     }
-
   } catch (e) {
-    console.error("✗ loadVoices:", e.message);
+    logDebug("loadVoices failed:", e.message || e);
     voiceSel.innerHTML = `<option value="default">Default (Agent)</option>`;
     CURRENT_VOICE_ID = "default";
     CURRENT_VOICE_LABEL = null;
   }
 }
-await loadVoices();
 
-// ===== Session Instruction (TEXT SESSION) =====
-function buildSessionInstruction(){
-  const voiceId = CURRENT_VOICE_ID || "default";
-  const voiceLabel = CURRENT_VOICE_LABEL || "default";
-  const lang       = VOICE_LANG_MAP[voiceId] || null;
-
-  return `SYSTEM INSTRUCTION:
-1) You MUST reply strictly in ${lang || "the same language as the user's last message"}.
-   If lang is provided, DO NOT use any other language.
-2) Always speak using voice label <${voiceLabel}>...</${voiceLabel}> only.
-3) Voice preference: voice_id=${voiceId}.
-4) Professional inbound tour consultant style.`;
+function wrapWithVoiceTag(text){
+  if (!CURRENT_VOICE_LABEL) return text;
+  return `<${CURRENT_VOICE_LABEL}>${text}</${CURRENT_VOICE_LABEL}>`;
 }
 
-// ===== Signed URL fetch (text session) =====
+
+function saveVoiceSelection(voiceId){
+  localStorage.setItem("selected_voice", voiceId);
+}
+
+/////////////////////// TTS preview ///////////////////////
+async function previewVoiceStream(voiceId, text){
+  try {
+    const res = await fetch(TTS_PREVIEW_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ voice_id: voiceId, text })
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(()=> "");
+      throw new Error(`TTS failed: ${res.status} ${txt}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onended = () => URL.revokeObjectURL(url);
+    await audio.play().catch(e=> logDebug("Preview autoplay blocked:", e.message || e));
+  } catch (e) {
+    logDebug("previewVoiceStream error:", e.message || e);
+  }
+}
+
+/////////////////////// Conversation SDK (text session) ///////////////////////
 async function fetchSignedUrl(){
-  logDebug("→ fetchSignedUrl()");
-  const res = await fetch(SIGNED_URL_ENDPOINT, { cache:"no-store" });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Không lấy được signed_url");
-  if (!data.signed_url) throw new Error("signed_url rỗng");
-  return data.signed_url;
+  const r = await fetch(SIGNED_URL_ENDPOINT, { cache: "no-store" });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "signed_url error");
+  if (!j.signed_url) throw new Error("signed_url missing");
+  return j.signed_url;
 }
 
-// ===== Start text session (Conversation SDK) =====
-async function startSession(){
-  if (connecting || connected) return;
-  connecting = true;
-  logDebug("→ startSession()");
+// ✅ startTextSession chỉ resolve SAU khi onConnect chạy
+async function startTextSession(){
+  if (textConnected && conversation) return;
+  if (textConnecting) {
+    // nếu đang connect, đợi tí
+    while (textConnecting) await sleep(100);
+    return;
+  }
 
-  try{
-    statusEl.textContent = tUI("statusFetchingSigned");
+  textConnecting = true;
+  statusEl.textContent = "text: connecting...";
+
+  try {
+    if (!Conversation) throw new Error("Conversation SDK not loaded");
     const signedUrl = await fetchSignedUrl();
-    statusEl.textContent = tUI("statusConnecting");
+
+    let connectResolve, connectReject;
+    const connectedPromise = new Promise((res, rej)=> {
+      connectResolve = res;
+      connectReject = rej;
+    });
+
+    const override = getCurrentConversationOverride();
 
     conversation = await Conversation.startSession({
       signedUrl,
       connectionType: "websocket",
-
+      overrides: {
+        agent: {
+          language: override.agent.language,  // ví dụ "vi"
+        },
+        tts: {
+          voiceId: override.tts.voice_id,     // LƯU Ý: camelCase cho SDK
+        },
+      },
       onConnect: async () => {
-        logDebug("✓ onConnect()");
-        connected = true;
-        connecting = false;
-        statusEl.textContent = tUI("statusConnected");
+        textConnected = true;
+        textConnecting = false;
+        statusEl.textContent = "text: connected";
         updateEndState();
 
-        heartbeat = setInterval(()=>{
-          try{ conversation?.sendUserActivity(); }catch{}
+        try { await conversation.setMicMuted(true); } catch {}
+        textHeartbeat = setInterval(() => {
+          try { conversation?.sendUserActivity(); } catch {}
         }, 5000);
 
-        // text-first mode: mute SDK mic
-        try{ await conversation.setMicMuted(true); }catch{}
-
-        // push voice rule
-        try{
-          conversation.sendUserMessage(buildSessionInstruction());
-        }catch(e){ console.warn(e); }
+        logDebug("Conversation onConnect with overrides:", override);
       },
-
       onDisconnect: () => {
-        logDebug("✗ onDisconnect()");
-        connected = false;
-        connecting = false;
-        if (heartbeat) clearInterval(heartbeat);
-        heartbeat = null;
+        logDebug("Conversation onDisconnect");
+        textConnected = false;
+        textConnecting = false;
+        if (textHeartbeat) clearInterval(textHeartbeat);
+        textHeartbeat = null;
         conversation = null;
-        statusEl.textContent = tUI("statusEnded");
+        statusEl.textContent = "text: disconnected";
         updateEndState();
+        if (!manualEnd) attemptTextReconnect();
       },
-
       onError: (e) => {
-        logDebug("✗ onError(): " + (e?.message || e));
-        connected = false;
-        connecting = false;
-        if (heartbeat) clearInterval(heartbeat);
-        heartbeat = null;
+        logDebug("Conversation onError:", e?.message || e);
+        textConnected = false;
+        textConnecting = false;
+        if (textHeartbeat) clearInterval(textHeartbeat);
+        textHeartbeat = null;
         conversation = null;
-        statusEl.textContent = tUI("statusError");
+        statusEl.textContent = "text: error";
         updateEndState();
+        connectReject(e);
+        attemptTextReconnect();
       },
-
-      onMessage: async ({ message, source }) => {
+      onMessage: ({ message, source }) => {
         if (!message?.text) return;
-        addMsg(source==="user" ? "user" : "agent", message.text);
-        if (source !== "user") lastAgentText = message.text;
+
+        if (source === "user") {
+          addMsg("user", message.text);
+        } else {
+           lastAgentText = message.text;
+
+          // nếu cuộc gọi đang hoạt động → KHÔNG hiển thị text
+          if (SessionLock.activeCall) return;
+
+          // nếu không call → cho hiện text như bình thường
+          addAgentMsgOnce(message.text);
+
+          // nếu agent nói câu kiểu kết thúc -> end session
+          const t = message.text.toLowerCase();
+          const isEnding =
+            /kết thúc cuộc gọi|cuộc gọi kết thúc|tạm biệt|hẹn gặp lại|goodbye|end call|bye/.test(t);
+          if (isEnding && !manualEnd) {
+            endAll();
+          }
+        }
       }
     });
 
-  }catch(err){
-    logDebug("✗ startSession catch: " + err.message);
-    connected = false;
-    connecting = false;
+    // Đợi tới khi onConnect chạy xong
+    await connectedPromise;
+  } catch (err) {
+    logDebug("startTextSession failed:", err.message || err);
+    textConnecting = false;
     conversation = null;
-    statusEl.textContent = tUI("statusCannotConnect");
+    statusEl.textContent = "text: cannot connect";
     updateEndState();
+    throw err;
   }
 }
 
-// ===== Send text =====
+let textReconnectAttempts = 0;
+async function attemptTextReconnect() {
+  if (manualEnd) {
+    console.warn("Reconnect blocked due to manual END");
+    return;
+  }
+  if (textReconnectAttempts > 5) return;
+
+  textReconnectAttempts++;
+  const delay = Math.min(30000, 1000 * Math.pow(2, textReconnectAttempts));
+  await sleep(delay);
+
+  try {
+    await startTextSession();
+    textReconnectAttempts = 0;
+  } catch {}
+}
+
 async function sendCurrentText(){
   const raw = textEl.value.trim();
   if (!raw) return;
-
-  if (!conversation || !connected){
-    await startSession();
-  }
-  if (!conversation || !connected) return;
-
-  const tagged = wrapWithVoiceTag(raw);
   addMsg("user", raw);
 
-  try{
-    conversation.sendUserMessage(tagged);
-    conversation.sendUserActivity();
-  }catch(e){
-    logDebug("✗ sendUserMessage: " + e.message);
+  try {
+     // ensure session (và apply voice/language mới nếu có)
+      await ensureTextSessionFresh();
+      if (!conversation || !textConnected) {
+        addMsg("agent", "Unable to send — text session not connected.");
+        return;
+      }
+  } catch {
+    addMsg("agent", "Unable to send — text session not connected.");
+    return;
   }
 
+  if (!conversation){
+    addMsg("agent", "Unable to send — text session not connected.");
+    return;
+  }
+
+  const tagged = wrapWithVoiceTag(raw);
+  try {
+    conversation.sendUserMessage(tagged);
+    conversation.sendUserActivity();
+  } catch (e) {
+    logDebug("sendCurrentText error:", e.message || e);
+    addMsg("agent", "Failed to send message: " + (e.message || e));
+  }
   textEl.value = "";
   updateSendState();
   textEl.focus();
 }
 
 async function restartTextSession(){
-  try{
-    if (conversation) {
-      await conversation.endSession();
-    }
-  }catch{}
+  try {
+    if (conversation) await conversation.endSession();
+  } catch {}
   conversation = null;
-  connected = false;
-  connecting = false;
-
-  if (heartbeat) clearInterval(heartbeat);
-  heartbeat = null;
-
-  await startSession(); // sẽ gửi instruction mới ở onConnect
+  textConnected = false;
+  textConnecting = false;
+  if (textHeartbeat) clearInterval(textHeartbeat);
+  textHeartbeat = null;
+  await startTextSession();
 }
 
-// ===== Lookup =====
-async function lookupInfo() {
-  const tourCode = tourCodeEl.value.trim();
-  const customerCode = customerCodeEl.value.trim();
-  const orderCode = orderCodeEl.value.trim();
+// Build override cho voice + language hiện tại
+function getCurrentConversationOverride() {
+  const voiceId = CURRENT_VOICE_ID;
+  const lang =
+    CURRENT_VOICE_LANG ||
+    (voiceId && VOICE_LANG_MAP[voiceId]) ||
+    "auto";
 
-  if (!tourCode && !customerCode && !orderCode) {
-    addMsg("agent", tUI("noCode"));
+  return {
+    tts: {
+      voice_id: voiceId || null      // snake_case cho WS
+    },
+    agent: {
+      language: lang                 // "vi", "en", "hi", ...
+    }
+  };
+}
+
+/////////////////////// Lookup helper ///////////////////////
+async function lookupInfo(){
+  const tourCode = tourCodeEl?.value.trim() || "";
+  const customerCode = customerCodeEl?.value.trim() || "";
+  const orderCode = orderCodeEl?.value.trim() || "";
+  if (!tourCode && !customerCode && !orderCode){
+    addMsg("agent", "Vui lòng nhập một trong: Tour Code, Customer Code, Order Code.");
     return;
   }
-
-  const payload =
-`LOOKUP REQUEST IN COMPANY SYSTEM:
+  const payload = `LOOKUP REQUEST IN COMPANY SYSTEM:
 - Tour Code: ${tourCode || "N/A"}
 - Customer Code: ${customerCode || "N/A"}
 - Order/Booking Code: ${orderCode || "N/A"}
-
 INSTRUCTIONS:
 1) Look up these codes in the internal system using tools/webhooks.
-2) Return the itinerary stops in correct order.
+2) Return itinerary stops in correct order.
 3) Return estimated timing per stop + main hotels/restaurants (if any).
 If no data found, clearly say so. Do NOT invent.`;
-
   textEl.value = payload;
   updateSendState();
   await sendCurrentText();
 }
 
-// ===== EVENTS (TEXT) =====
-sendBtn.addEventListener("click", sendCurrentText);
-textEl.addEventListener("input", updateSendState);
-textEl.addEventListener("keydown",(e)=>{
-  if(e.key==="Enter" && !e.shiftKey) sendCurrentText();
-});
-
-
-// ===== Voice change: ONE FLOW for text + call =====
-async function previewVoiceStream(voiceId, text) {
-  const r = await fetch("/api/tts-stream", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      voice_id: voiceId,
-      text
-    })
-  });
-
-  if (!r.ok) {
-    const err = await r.text().catch(()=> "");
-    console.error("TTS stream error:", r.status, err);
-    return;
-  }
-
-  const blob = await r.blob();
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  audio.onended = () => URL.revokeObjectURL(url);
-  await audio.play().catch(e => console.warn("Autoplay blocked:", e));
-}
-
-voiceSel.addEventListener("change", async () => {
-  const vid = voiceSel.value;
-
-  // === Update voice state ===
-  CURRENT_VOICE_ID = vid;
-  CURRENT_VOICE_LABEL = VOICE_LABEL_MAP[vid] || null;
-  localStorage.setItem("selected_voice", vid);
-
-  const trainedLang = VOICE_LANG_MAP[vid] || null;
-
-  // === 1) Preview giọng đọc mới theo nội dung thực ===
-  const sampleText =
-      (lastAgentText && lastAgentText.trim()) ? lastAgentText :
-      (textEl.value.trim() ? textEl.value.trim() :
-       "Xin chào, đây là giọng đọc mới bạn vừa chọn.");
-
-  try {
-    await previewVoiceStream(vid, sampleText);
-  } catch (e) {
-    console.warn("Preview failed:", e);
-  }
-
-  // === 2) Restart WebSocket để áp LANGUAGE + VOICE ID mới ===
-  // buildConversationConfigOverride() là hàm bạn đã có
-  try {
-    await restartWsSession();  // bạn đã có hàm này trong code 1-WS
-  } catch (e) {
-    console.warn("restartWsSession failed:", e);
-  }
-  
-  callBtn.disabled=false;
-  // === 3) Sau khi WS open lại → agent sẽ dùng voice & language mới ===
-  /*addMsg(
-    "agent",
-    `🔄 Voice → ${CURRENT_VOICE_LABEL || vid} | Language → ${trainedLang || "auto"}`
-  );*/
-});
-
-
-
-
-// ======================================================================
-// ================= VOICE CALL (RAW WS + worklet) =======================
-// ======================================================================
-
-// get signed ws url for call
-async function getCallWsUrl(){
-  const r = await fetch(CALL_WS_URL_ENDPOINT, {method:"POST"});
-  const j = await r.json();
-  if(!j.ws_url) throw new Error(j.error||"no ws_url");
-  return j.ws_url;
-}
-
-function callWsSend(obj){
-  if(callWs && callWs.readyState===1){
+/////////////////////// CALL (raw WS) ///////////////////////
+// Gửi qua WS nếu open
+function callWsSend(obj) {
+  if (callWs && callWs.readyState === WebSocket.OPEN) {
     callWs.send(JSON.stringify(obj));
   }
 }
 
-// play call audio
-async function playCallBase64Audio(b64, mime="audio/mpeg"){
-  callAudioQueue.push({b64, mime});
-  if(callPlaying) return;
+// Play audio base64 từ server (audio/mpeg)
+async function playCallBase64Audio(b64, mime = "audio/mpeg") {
+  callAudioQueue.push({ b64, mime });
+  if (callPlaying) return;
   callPlaying = true;
 
-  while(callAudioQueue.length){
-    const {b64, mime} = callAudioQueue.shift();
-    const bytes = Uint8Array.from(atob(b64), c=>c.charCodeAt(0));
-    const blob = new Blob([bytes], {type:mime});
-    const url = URL.createObjectURL(blob);
-    const a = new Audio(url);
-    await a.play().catch(()=>{});
-    await new Promise(r=> a.onended=r);
-    URL.revokeObjectURL(url);
+  while (callAudioQueue.length) {
+    const { b64, mime } = callAudioQueue.shift();
+    try {
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      await audio.play().catch(e =>
+        logDebug("call audio play failed:", e.message || e)
+      );
+      await new Promise(res => {
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          res();
+        };
+      });
+    } catch (e) {
+      logDebug("playCallBase64Audio error:", e.message || e);
+    }
   }
+
   callPlaying = false;
 }
 
-// connect call ws
-function connectCallWs(wsUrl){
-  callWs = new WebSocket(wsUrl);
- 
-  callWs.onopen = async ()=>{
-  statusEl.textContent = "call connected";
-
-  const language = VOICE_LANG_MAP[CURRENT_VOICE_ID] || null;
-  const voice_id = CURRENT_VOICE_ID || null;
-
-  const overrides = {};
-  if (language) overrides.language = language;   // ví dụ "vi","en","hi"
-  if (voice_id) overrides.voice_id = voice_id;
-
-  // ✅ Initiation + overrides chuẩn
-  callWsSend({
-    type: "conversation_initiation_client_data",
-    overrides
-  });
-
-  // ✅ fallback ép label nếu overrides bị ignore (Agent chưa bật Allow overrides)
-  applyVoiceRuleToCallWs();
-  if (language){
-    callWsSend({
-      type: "user_message",
-      text: `SYSTEM: Speak strictly in ${language}.`
-    });
-  }
-
-  await callStartMicPCM();
-  };
-
-
-  callWs.onclose = ()=>{
-    statusEl.textContent = "call ended";
-  };
-
-  callWs.onerror = (e)=>{
-    console.error("call ws error", e);
-  };
-
-  callWs.onmessage = async (ev)=>{
-    let data;
-    try{ data = JSON.parse(ev.data); }catch{ return; }
-
-    if (data.type === "ping") {
-      callWsSend({ type: "pong", event_id: data.ping_event?.event_id });
-      return;
-    }
-    if (data.type === "agent_response") {
-      const t = data.agent_response_event?.agent_response;
-      if (t){
-        addMsg("agent", t);
-        lastAgentText = t;
-      }
-      return;
-    }
-    if (data.type === "audio") {
-      const b64 = data.audio_event?.audio_base_64;
-      if (b64) await playCallBase64Audio(b64, "audio/mpeg");
-      return;
-    }
-  };
+// Lấy signed WS URL cho call
+async function getCallWsUrl() {
+  const r = await fetch(CALL_WS_URL_ENDPOINT, { method: "POST" });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "no ws_url");
+  if (!j.ws_url) throw new Error("ws_url missing");
+  return j.ws_url;
 }
 
-// mic streaming (pcm worklet @16k)
+// Bắt đầu lấy mic (PCM 16k) – cần /pcm-worklet.js
 async function callStartMicPCM() {
   callMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   callMicCtx = new AudioContext({ sampleRate: 16000 });
@@ -551,87 +505,355 @@ async function callStartMicPCM() {
   const src = callMicCtx.createMediaStreamSource(callMicStream);
   const worklet = new AudioWorkletNode(callMicCtx, "pcm-worklet");
 
-  worklet.port.onmessage = (ev) => {
-    const b64 = ev.data;
+  worklet.port.onmessage = ev => {
+    const b64 = ev.data; // base64-encoded raw pcm chunk
     callWsSend({ user_audio_chunk: b64 });
   };
 
   src.connect(worklet);
+  logDebug("callStartMicPCM: mic started");
 }
 
+// Dừng mic
 function callStopMicPCM() {
-  if (callMicStream) callMicStream.getTracks().forEach(t => t.stop());
-  if (callMicCtx) callMicCtx.close();
+  try {
+    if (callMicStream) {
+      callMicStream.getTracks().forEach(t => t.stop());
+    }
+  } catch (e) {
+    logDebug("callStopMicPCM stream stop error:", e.message || e);
+  }
+
+  try {
+    if (callMicCtx && callMicCtx.state !== "closed") {
+      callMicCtx.close();
+    }
+  } catch (e) {
+    logDebug("callStopMicPCM ctx close error:", e.message || e);
+  }
+
   callMicStream = null;
   callMicCtx = null;
+
+  logDebug("callStopMicPCM: microphone stopped");
 }
 
-//Thêm helper restart call WS (để đổi voice/language)
-async function restartCallWs(){
-  try{
-    callStopMicPCM();
-    if (callWs) callWs.close();
-  }catch{}
+// Restart call WS với voice/language mới
+async function restartCallWs() {
+  logDebug("restartCallWs: begin");
+
+  // dừng mic & đóng ws cũ
+  try { callStopMicPCM(); } catch (e) {
+    logDebug("restartCallWs: callStopMicPCM err:", e.message || e);
+  }
+
+  try {
+    if (callWs && callWs.readyState === WebSocket.OPEN) {
+      callWs.close(1000, "voice_changed_restart");
+    }
+  } catch (e) {
+    logDebug("restartCallWs: callWs.close err:", e.message || e);
+  }
+
   callWs = null;
 
-  const wsUrl = await getCallWsUrl();
-  connectCallWs(wsUrl);
+  // lấy url mới & connect lại
+  let wsUrl;
+  try {
+    wsUrl = await getCallWsUrl();
+  } catch (e) {
+    logDebug("restartCallWs: getCallWsUrl failed:", e.message || e);
+    return;
+  }
+
+  try {
+    connectCallWs(wsUrl);
+  } catch (e) {
+    logDebug("restartCallWs: connectCallWs failed:", e.message || e);
+  }
+}
+// Kết nối WebSocket call
+function connectCallWs(wsUrl) {
+  if (!wsUrl) throw new Error("wsUrl required");
+  callWs = new WebSocket(wsUrl);
+
+  callWs.onopen = async () => {
+    statusEl.textContent = "call: connected";
+
+    const override = getCurrentConversationOverride();
+    logDebug("CALL OVERRIDE SEND:", override);
+
+    // ĐÚNG SPEC ELEVENLABS:
+    callWsSend({
+      type: "conversation_initiation_client_data",
+      conversation_config_override: override
+    });
+
+    try {
+      await callStartMicPCM();
+    } catch (e) {
+      logDebug("callStartMicPCM failed:", e.message || e);
+    }
+
+    logDebug("callWs connected");
+  };
+
+  callWs.onclose = () => {
+    logDebug("call ws closed");
+    SessionLock.markCallDisconnected();
+    statusEl.textContent = "call ended";
+    callStopMicPCM();
+  };
+
+  callWs.onerror = (e) => {
+    logDebug("callWs error:", e.message || e);
+  };
+
+  callWs.onmessage = async (ev) => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+
+    if (data.type === "ping") {
+      callWsSend({ type: "pong", event_id: data.ping_event?.event_id });
+      return;
+    }
+
+    if (data.type === "agent_response") {
+      const t = data.agent_response_event?.agent_response;
+      if (t) {
+        addAgentMsgOnce(t);
+        lastAgentText = t;
+      }
+      return;
+    }
+
+    if (data.type === "audio") {
+      const b64 = data.audio_event?.audio_base_64;
+      if (b64) await playCallBase64Audio(b64, "audio/mpeg");
+      return;
+    }
+
+    if (data.type === "system_message" && data.message) {
+      logDebug("call system_message:", data.message);
+    }
+  };
 }
 
-// call button
-callBtn.onclick = async ()=>{
+
+/////////////////////// Unified restart when voice changed ///////////////////////
+async function onVoiceChanged(voiceId){
+  CURRENT_VOICE_ID    = voiceId;
+  CURRENT_VOICE_LABEL = VOICE_LABEL_MAP[voiceId] || null;
+
+  // cập nhật language hiện tại từ map / option
+  const opt = voiceSel.options[voiceSel.selectedIndex];
+  const langFromOpt =
+    opt?.dataset.lang ||
+    VOICE_LANG_MAP[voiceId] ||
+    "auto";
+
+  CURRENT_VOICE_LANG         = langFromOpt;
+  VOICE_LANG_MAP[voiceId]    = langFromOpt;
+  pendingVoiceChange         = true;        // 🔥 ĐÁNH CỜ: lượt tới phải restart session
+
+  saveVoiceSelection(voiceId);
+
+  const sampleText =
+    (lastAgentText && lastAgentText.trim())
+      ? lastAgentText
+      : (textEl.value.trim() ||
+         "Xin chào, đây là giọng đọc mới bạn vừa chọn.");
+
+  // Preview TTS cho user nghe thử — không liên quan session
+  try { await previewVoiceStream(voiceId, sampleText); }
+  catch(e){ logDebug("voice preview failed:", e.message || e); }
+
+  addMsg(
+    "agent",
+    `🔊 Voice set to: ${CURRENT_VOICE_LABEL || voiceId} • Language: ${CURRENT_VOICE_LANG}`
+  );
+}
+
+
+/////////////////////// End call / end text ///////////////////////
+async function endAll() {
+  manualEnd = true;  // khóa auto reconnect
+
+  // end text
+  if (conversation){
+    try { await conversation.endSession(); } catch{}
+  }
+  conversation = null;
+  textConnected = false;
+  textConnecting = false;
+
+  if (textHeartbeat) {
+    clearInterval(textHeartbeat);
+    textHeartbeat = null;
+  }
+
+  // end call
+  try { callStopMicPCM(); } catch{}
+
+  if (callWs) {
+    try { callWs.close(1000, "manual_end_call"); } catch{}
+  }
+  callWs = null;
+
+  SessionLock.markCallDisconnected();   // ✅ dùng đúng method
+  statusEl.textContent = "ended";
+  if (callBtn) callBtn.disabled = false;
+}
+
+function updateEndState(){
+  if (!endBtn) return;
+  endBtn.disabled = !textConnected;
+}
+
+/////////////////////// UI Event wiring ///////////////////////
+function updateSendState(){
+  if (sendBtn) sendBtn.disabled = textEl.value.trim().length === 0;
+}
+
+sendBtn?.addEventListener("click", sendCurrentText);
+textEl?.addEventListener("input", updateSendState);
+textEl?.addEventListener("keydown", (e)=>{
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendCurrentText();
+  }
+});
+
+document.getElementById("lookupBtn")?.addEventListener("click", lookupInfo);
+
+voiceSel?.addEventListener("change", async () => {
+  const vid = voiceSel.value;
+  const opt = voiceSel.options[voiceSel.selectedIndex];
+
+  CURRENT_VOICE_ID   = vid;
+  CURRENT_VOICE_LANG = opt?.dataset.lang || VOICE_LANG_MAP[vid] || "auto";
+  VOICE_LANG_MAP[vid] = CURRENT_VOICE_LANG;
+
+  pendingVoiceChange = true;   // 🔥 báo cho callBtn biết lần tới phải dùng config mới
+
+  // Preview TTS (không ảnh hưởng tới call)
+  const sampleText =
+    (lastAgentText && lastAgentText.trim())
+      ? lastAgentText
+      : (textEl.value.trim() || "Xin chào, đây là giọng đọc mới bạn vừa chọn.");
+
+  try { await previewVoiceStream(vid, sampleText); }
+  catch (e) { logDebug("voice preview failed:", e.message || e); }
+});
+
+
+callBtn?.addEventListener("click", async () => {
+
+  if (!SessionLock.requestCallStart()) {
+    addMsg("agent", "⚠ Cuộc gọi đang hoạt động. Không thể tạo cuộc gọi mới.");
+    return;
+  }
+
   callBtn.disabled = true;
-  try{
-    await startSession(); // ensure text session ready
+  endBtn.disabled =false;
+
+  try {
+    // nếu vừa đổi voice → đảm bảo dùng config mới
+    if (pendingVoiceChange) {
+      await restartCallWs();
+      pendingVoiceChange = false;
+      // restartCallWs tự connect lại rồi – không cần getCallWsUrl ở đây nữa
+      SessionLock.markCallConnected();
+      return;
+    }
+
+    // nếu chưa có ws → tạo mới
     const wsUrl = await getCallWsUrl();
     connectCallWs(wsUrl);
-  }catch(err){
-    console.error(err);
-    addMsg("agent", "Failed to start call: " + err.message);
-    callBtn.disabled=false;
+
+    SessionLock.markCallConnected();
+  } catch (e) {
+    logDebug("callBtn click error:", e.message || e);
+    SessionLock.markCallDisconnected();
+    callBtn.disabled = false;
+  }
+});
+
+endBtn?.addEventListener("click", async () => {
+  await endAll();
+});
+
+document.getElementById("restartTextBtn")?.addEventListener("click", async ()=>{
+  await restartTextSession();
+});
+
+document.addEventListener("keydown", (e)=>{
+  if (e.key === "Escape") {
+    try { if (callWs) callWs.close(); } catch {}
+  }
+});
+
+/////////////////////// Initialization ///////////////////////
+async function init(){
+  try {
+    statusEl.textContent = "loading...";
+
+    // 1) Load SDK
+    try {
+      const mod = await import("https://esm.sh/@elevenlabs/client@0.11.0?bundle");
+      Conversation = mod.Conversation;
+      logDebug("Conversation SDK loaded");
+    } catch (e) {
+      logDebug("SDK import failed:", e.message || e);
+      statusEl.textContent = "SDK load failed";
+      return; // ❗ Không có SDK thì khỏi cố start session
+    }
+
+    // 2) Load voices
+    await loadVoices();
+
+    // 3) Tự động start text session khi mở trang
+    try {
+      await startTextSession();              // 🔥 CHÍNH LÀ DÒNG NÀY
+    } catch (e) {
+      logDebug("auto startTextSession failed:", e.message || e);
+      // không throw tiếp – vẫn cho UI dùng, lần gửi đầu sẽ attempt lại
+    }
+
+    updateSendState();
+    updateEndState();
+    statusEl.textContent = textConnected ? "text: connected" : "ready";
+  } catch (e) {
+    logDebug("init error:", e.message || e);
+    statusEl.textContent = "init error";
+  }
+}
+
+// ======================
+// SESSION LOCK (anti-double connect)
+// ======================
+const SessionLock = {
+  activeCall: false,
+  connectingCall: false,
+
+  requestCallStart() {
+    if (this.activeCall || this.connectingCall) return false;
+    this.connectingCall = true;
+    return true;
+  },
+
+  markCallConnected() {
+    this.activeCall = true;
+    this.connectingCall = false;
+  },
+
+  markCallDisconnected() {
+    this.activeCall = false;
+    this.connectingCall = false;
   }
 };
 
-// end call button
-async function endCall(){
-  if (conversation) {
-    try { await conversation.endSession(); } catch {}
-  }
-  conversation = null;
-  connected = false;
-  connecting = false;
+// start
+init();
 
-  if (heartbeat) clearInterval(heartbeat);
-  heartbeat = null;
-
-  callStopMicPCM();
-  if(callWs) callWs.close();
-  callWs = null;
-
-  statusEl.textContent = tUI("statusEnded");
-  updateEndState();
-  if(callBtn) callBtn.disabled=false;
-}
-if (endBtn) endBtn.addEventListener("click", endCall);
-
-// update state of end button
-function updateEndState(){
-  if (!endBtn) return;
-  endBtn.disabled = !connected;
-}
-
-// ===== Load SDK =====
-try{
-  statusEl.textContent = tUI("statusLoading");
-  const mod = await import("https://esm.sh/@elevenlabs/client@0.11.0?bundle");
-  Conversation = mod.Conversation;
-  logDebug("✓ Imported Conversation SDK");
-  statusEl.textContent = tUI("statusReady");
-}catch(e){
-  logDebug("✗ Import SDK failed: " + e.message);
-  statusEl.textContent = tUI("statusError");
-}
-
-updateSendState();
-updateEndState();
-
+/////////////////////////////////// End of file ///////////////////////////////////
