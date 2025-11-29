@@ -2,6 +2,17 @@
 // static/js/i18n.js
 // UI I18N layer for Trantourist Assistant
 // This module is imported by assistant.js
+export function changeMessageVoice(CURRENT_VOICE_LANG) {
+  const messages = {
+    vi: "Xin chào! Tôi là trợ lý mà bạn vừa chọn. Rất vui được đồng hành cùng bạn.",
+    en: "Hello! I'm the assistant you just selected. Happy to accompany you.",
+    ja: "こんにちは！私はあなたが選んだ新しいアシスタントです。これからよろしくお願いします。",
+    ko: "안녕하세요! 저는 당신이 방금 선택한 새 어시스턴트입니다. 잘 부탁드립니다.",
+    zh: "你好！我是你刚选择的助理，很高兴为你服务。",
+  };
+
+  return messages[CURRENT_VOICE_LANG] || messages.en;
+}
 
 export const I18N = {
   vi: {
@@ -208,3 +219,5 @@ export function initUILangHeader({
 
   return { setUILangHeader };
 }
+
+

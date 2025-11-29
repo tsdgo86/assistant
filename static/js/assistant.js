@@ -1,4 +1,6 @@
 // assistant.js — Trantourist Assistant (fixed, 2025-11)
+import { changeMessageVoice } from "./i18n.js";
+
 // ====================== CONFIG ENDPOINTS ======================
 const SIGNED_URL_ENDPOINT   = "/api/signed-url";
 const CALL_WS_URL_ENDPOINT  = "/api/get-ws-url";
@@ -55,6 +57,7 @@ let callMicCtx = null;
 let callAudioQueue = [];
 let callPlaying = false;
 let manualEnd = false;
+let callOutCtx = null;
 
 // Voice metadata
 let VOICE_LABEL_MAP = {}; // voice_id -> label
@@ -360,24 +363,21 @@ async function attemptTextReconnect() {
   } catch {}
 }
 
-async function sendCurrentText(){
+async function sendCurrentText() {
   const raw = textEl.value.trim();
   if (!raw) return;
   addMsg("user", raw);
 
   try {
-     // ensure session (và apply voice/language mới nếu có)
-      await ensureTextSessionFresh();
-      if (!conversation || !textConnected) {
-        addMsg("agent", "Unable to send — text session not connected.");
-        return;
-      }
+    // Đảm bảo có session (nếu bật auto trong init thì thường đã có)
+    if (!conversation || !textConnected) {
+      await startTextSession();
+    }
+    if (!conversation || !textConnected) {
+      addMsg("agent", "Unable to send — text session not connected.");
+      return;
+    }
   } catch {
-    addMsg("agent", "Unable to send — text session not connected.");
-    return;
-  }
-
-  if (!conversation){
     addMsg("agent", "Unable to send — text session not connected.");
     return;
   }
@@ -457,33 +457,43 @@ function callWsSend(obj) {
 }
 
 // Play audio base64 từ server (audio/mpeg)
-async function playCallBase64Audio(b64, mime = "audio/mpeg") {
-  callAudioQueue.push({ b64, mime });
-  if (callPlaying) return;
-  callPlaying = true;
+async function playCallBase64Audio(b64, format = "mp3") {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
 
-  while (callAudioQueue.length) {
-    const { b64, mime } = callAudioQueue.shift();
-    try {
-      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-      const blob = new Blob([bytes], { type: mime });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      await audio.play().catch(e =>
-        logDebug("call audio play failed:", e.message || e)
-      );
-      await new Promise(res => {
-        audio.onended = () => {
-          URL.revokeObjectURL(url);
-          res();
-        };
-      });
-    } catch (e) {
-      logDebug("playCallBase64Audio error:", e.message || e);
+  // Nếu là PCM 16k raw:
+  if (format === "pcm_16000") {
+    if (!callOutCtx) {
+      callOutCtx = new AudioContext({ sampleRate: 16000 });
     }
+
+    // 2 bytes / sample
+    const sampleCount = bytes.length / 2;
+    const buffer = callOutCtx.createBuffer(1, sampleCount, 16000);
+    const ch = buffer.getChannelData(0);
+
+    for (let i = 0; i < sampleCount; i++) {
+      const lo = bytes[i * 2];
+      const hi = bytes[i * 2 + 1];
+      let sample = (hi << 8) | lo;           // int16
+      if (sample > 32767) sample -= 65536;   // convert to signed
+      ch[i] = sample / 32768;               // [-1, 1]
+    }
+
+    const src = callOutCtx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(callOutCtx.destination);
+    src.start();
+    return;
   }
 
-  callPlaying = false;
+  // Còn lại coi như MP3
+  const blob = new Blob([bytes], { type: "audio/mpeg" });
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  audio.onended = () => URL.revokeObjectURL(url);
+  await audio.play().catch(e =>
+    logDebug("call audio play failed:", e.message || e)
+  );
 }
 
 // Lấy signed WS URL cho call
@@ -641,37 +651,45 @@ function connectCallWs(wsUrl) {
 
 
 /////////////////////// Unified restart when voice changed ///////////////////////
-async function onVoiceChanged(voiceId){
+async function onVoiceChanged(voiceId) {
+  const opt = voiceSel.options[voiceSel.selectedIndex];
+
   CURRENT_VOICE_ID    = voiceId;
   CURRENT_VOICE_LABEL = VOICE_LABEL_MAP[voiceId] || null;
-
-  // cập nhật language hiện tại từ map / option
-  const opt = voiceSel.options[voiceSel.selectedIndex];
-  const langFromOpt =
-    opt?.dataset.lang ||
-    VOICE_LANG_MAP[voiceId] ||
-    "auto";
-
-  CURRENT_VOICE_LANG         = langFromOpt;
-  VOICE_LANG_MAP[voiceId]    = langFromOpt;
-  pendingVoiceChange         = true;        // 🔥 ĐÁNH CỜ: lượt tới phải restart session
+  CURRENT_VOICE_LANG  = opt?.dataset.lang || VOICE_LANG_MAP[voiceId] || "auto";
+  VOICE_LANG_MAP[voiceId] = CURRENT_VOICE_LANG;
 
   saveVoiceSelection(voiceId);
-
   const sampleText =
     (lastAgentText && lastAgentText.trim())
       ? lastAgentText
-      : (textEl.value.trim() ||
-         "Xin chào, đây là giọng đọc mới bạn vừa chọn.");
+      : (textEl.value.trim() || changeMessageVoice(CURRENT_VOICE_LANG))
 
-  // Preview TTS cho user nghe thử — không liên quan session
-  try { await previewVoiceStream(voiceId, sampleText); }
-  catch(e){ logDebug("voice preview failed:", e.message || e); }
-
+   // ✅ HIỆN TEXT TRONG CHAT KHI ĐỔI GIỌNG
   addMsg(
     "agent",
-    `🔊 Voice set to: ${CURRENT_VOICE_LABEL || voiceId} • Language: ${CURRENT_VOICE_LANG}`
+    `🔊 Voice: ${CURRENT_VOICE_LABEL || voiceId} • Language: ${CURRENT_VOICE_LANG}\n` +
+    `🗣 Sample: ${sampleText}`
   );
+
+  // Preview TTS (cho user nghe thử)
+  try { await previewVoiceStream(voiceId, sampleText); }
+  catch (e) { logDebug("voice preview failed:", e.message || e); }
+
+  logDebug("Voice changed:", {
+    voiceId: CURRENT_VOICE_ID,
+    lang: CURRENT_VOICE_LANG
+  });
+
+  // 🔥 Restart text session với ngôn ngữ + voice mới
+  try { await restartTextSession(); }
+  catch (e) { logDebug("restartTextSession failed:", e.message || e); }
+
+  // 🔥 Nếu đang có cuộc gọi, restart luôn call để dùng voice mới
+  if (SessionLock.activeCall) {
+    try { await restartCallWs(); }
+    catch (e) { logDebug("restartCallWs failed:", e.message || e); }
+  }
 }
 
 
@@ -728,49 +746,22 @@ document.getElementById("lookupBtn")?.addEventListener("click", lookupInfo);
 
 voiceSel?.addEventListener("change", async () => {
   const vid = voiceSel.value;
-  const opt = voiceSel.options[voiceSel.selectedIndex];
-
-  CURRENT_VOICE_ID   = vid;
-  CURRENT_VOICE_LANG = opt?.dataset.lang || VOICE_LANG_MAP[vid] || "auto";
-  VOICE_LANG_MAP[vid] = CURRENT_VOICE_LANG;
-
-  pendingVoiceChange = true;   // 🔥 báo cho callBtn biết lần tới phải dùng config mới
-
-  // Preview TTS (không ảnh hưởng tới call)
-  const sampleText =
-    (lastAgentText && lastAgentText.trim())
-      ? lastAgentText
-      : (textEl.value.trim() || "Xin chào, đây là giọng đọc mới bạn vừa chọn.");
-
-  try { await previewVoiceStream(vid, sampleText); }
-  catch (e) { logDebug("voice preview failed:", e.message || e); }
+  await onVoiceChanged(vid);
 });
 
 
 callBtn?.addEventListener("click", async () => {
-
   if (!SessionLock.requestCallStart()) {
     addMsg("agent", "⚠ Cuộc gọi đang hoạt động. Không thể tạo cuộc gọi mới.");
     return;
   }
 
   callBtn.disabled = true;
-  endBtn.disabled =false;
+  endBtn.disabled = false;
 
   try {
-    // nếu vừa đổi voice → đảm bảo dùng config mới
-    if (pendingVoiceChange) {
-      await restartCallWs();
-      pendingVoiceChange = false;
-      // restartCallWs tự connect lại rồi – không cần getCallWsUrl ở đây nữa
-      SessionLock.markCallConnected();
-      return;
-    }
-
-    // nếu chưa có ws → tạo mới
     const wsUrl = await getCallWsUrl();
     connectCallWs(wsUrl);
-
     SessionLock.markCallConnected();
   } catch (e) {
     logDebug("callBtn click error:", e.message || e);
@@ -778,6 +769,7 @@ callBtn?.addEventListener("click", async () => {
     callBtn.disabled = false;
   }
 });
+
 
 endBtn?.addEventListener("click", async () => {
   await endAll();
