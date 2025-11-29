@@ -40,7 +40,7 @@ function addMsg(role, text){
   chatEl.appendChild(div);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
-function safeJSON(text){ try { return JSON.parse(text); } catch { return null; } }
+
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
 /////////////////////// STATE ///////////////////////
@@ -54,8 +54,6 @@ let textHeartbeat = null;
 let callWs = null;
 let callMicStream = null;
 let callMicCtx = null;
-let callAudioQueue = [];
-let callPlaying = false;
 let manualEnd = false;
 let callOutCtx = null;
 
@@ -65,7 +63,10 @@ let VOICE_LANG_MAP  = {}; // voice_id -> trained language
 let CURRENT_VOICE_ID = null;
 let CURRENT_VOICE_LABEL = null;
 let CURRENT_VOICE_LANG = "auto"; 
-
+let currentCallSource = null;  // AudioBufferSourceNode đang phát
+let callAudioStopped = false;  // flag báo đã end call
+let callAudioQueue = [];
+let callPlaying = false;
 // 🔥 cờ báo cần restart session theo voice mới
 let pendingVoiceChange = false;
 // Last agent text (for preview/resay)
@@ -260,7 +261,7 @@ async function startTextSession(){
     });
 
     const override = getCurrentConversationOverride();
-
+    
     conversation = await Conversation.startSession({
       signedUrl,
       connectionType: "websocket",
@@ -457,44 +458,82 @@ function callWsSend(obj) {
 }
 
 // Play audio base64 từ server (audio/mpeg)
-async function playCallBase64Audio(b64, format = "mp3") {
-  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+async function playCallBase64Audio(b64, format = "pcm_16000") {
+  // Nếu cuộc gọi đã kết thúc, bỏ qua mọi audio mới
+  if (callAudioStopped) return;
 
-  // Nếu là PCM 16k raw:
-  if (format === "pcm_16000") {
-    if (!callOutCtx) {
-      callOutCtx = new AudioContext({ sampleRate: 16000 });
+  callAudioQueue.push({ b64, format });
+  if (callPlaying) return;
+  callPlaying = true;
+
+  while (callAudioQueue.length && !callAudioStopped) {
+    const { b64, format } = callAudioQueue.shift();
+
+    try {
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+
+      // ===== CASE 1: PCM 16k =====
+      if (format === "pcm_16000") {
+        if (!callOutCtx || callOutCtx.state === "closed") {
+          callOutCtx = new AudioContext({ sampleRate: 16000 });
+        }
+
+        const sampleCount = bytes.length / 2;        // 2 bytes / sample (int16)
+        const buffer = callOutCtx.createBuffer(1, sampleCount, 16000);
+        const ch = buffer.getChannelData(0);
+
+        for (let i = 0; i < sampleCount; i++) {
+          const lo = bytes[i * 2];
+          const hi = bytes[i * 2 + 1];
+          let sample = (hi << 8) | lo;             // int16 little-endian
+
+          if (sample > 32767) sample -= 65536;     // convert to signed
+          ch[i] = sample / 32768;                  // [-1, 1] float
+        }
+
+        const src = callOutCtx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(callOutCtx.destination);
+        currentCallSource = src;
+
+        src.start();
+
+        // Đợi buffer phát xong hoặc bị stop
+        await new Promise(resolve => {
+          src.onended = () => {
+            if (currentCallSource === src) {
+              currentCallSource = null;
+            }
+            resolve();
+          };
+        });
+      }
+
+      // ===== CASE 2: MP3 fallback (nếu sau này muốn dùng MP3) =====
+      else if (format === "mp3") {
+        const blob = new Blob([bytes], { type: "audio/mpeg" });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        await audio.play().catch(e =>
+          logDebug("call audio play failed:", e.message || e)
+        );
+        await new Promise(r => {
+          audio.onended = () => {
+            URL.revokeObjectURL(url);
+            r();
+          };
+        });
+      }
+
+    } catch (e) {
+      logDebug("playCallBase64Audio error:", e.message || e);
     }
-
-    // 2 bytes / sample
-    const sampleCount = bytes.length / 2;
-    const buffer = callOutCtx.createBuffer(1, sampleCount, 16000);
-    const ch = buffer.getChannelData(0);
-
-    for (let i = 0; i < sampleCount; i++) {
-      const lo = bytes[i * 2];
-      const hi = bytes[i * 2 + 1];
-      let sample = (hi << 8) | lo;           // int16
-      if (sample > 32767) sample -= 65536;   // convert to signed
-      ch[i] = sample / 32768;               // [-1, 1]
-    }
-
-    const src = callOutCtx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(callOutCtx.destination);
-    src.start();
-    return;
   }
 
-  // Còn lại coi như MP3
-  const blob = new Blob([bytes], { type: "audio/mpeg" });
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  audio.onended = () => URL.revokeObjectURL(url);
-  await audio.play().catch(e =>
-    logDebug("call audio play failed:", e.message || e)
-  );
+  currentCallSource = null;
+  callPlaying = false;
 }
+
 
 // Lấy signed WS URL cho call
 async function getCallWsUrl() {
@@ -547,6 +586,28 @@ function callStopMicPCM() {
 
   logDebug("callStopMicPCM: microphone stopped");
 }
+
+function stopCallAudioPlayback() {
+  callAudioStopped = true;
+  callAudioQueue = [];
+  callPlaying = false;
+
+  if (currentCallSource) {
+    try {
+      currentCallSource.stop();
+    } catch {}
+    currentCallSource.disconnect();
+    currentCallSource = null;
+  }
+
+  if (callOutCtx && callOutCtx.state !== "closed") {
+    // Không bắt buộc phải close, có thể giữ để reuse.
+    // Nếu bạn muốn cắt hẳn thì bỏ comment dòng dưới:
+    // callOutCtx.close();
+  }
+}
+
+
 
 // Restart call WS với voice/language mới
 async function restartCallWs() {
@@ -638,8 +699,13 @@ function connectCallWs(wsUrl) {
     }
 
     if (data.type === "audio") {
-      const b64 = data.audio_event?.audio_base_64;
-      if (b64) await playCallBase64Audio(b64, "audio/mpeg");
+      const ev  = data.audio_event;
+      const b64 = ev?.audio_base_64;
+      const fmt = ev?.format || "pcm_16000";   // ElevenLabs default
+
+      if (b64) {
+          await playCallBase64Audio(b64, fmt); // <-- PCM decoder
+      }
       return;
     }
 
@@ -712,6 +778,7 @@ async function endAll() {
 
   // end call
   try { callStopMicPCM(); } catch{}
+  stopCallAudioPlayback();          // 🔥 CẮT AUDIO NGAY
 
   if (callWs) {
     try { callWs.close(1000, "manual_end_call"); } catch{}
